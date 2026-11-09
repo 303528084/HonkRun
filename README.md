@@ -1,6 +1,6 @@
 # HonkRun
 
-仿 `303528084/OpenWrtRun` 的思路，为 [daeuniverse/honk](https://github.com/daeuniverse/honk) 做的一套 GitHub Actions 自动化仓库：每天从 daeuniverse 官方 OpenWrt apk feed 同步最新 honk 组件，用 `makeself`（或内置自解压头）打成单个 `.run` 自解压安装包，发布到本仓库的 Release。
+仿上游仓库 <https://github.com/wkccd/CloudRunFilesBuilder> 的思路，为 [daeuniverse/honk](https://github.com/daeuniverse/honk) 做的一套 GitHub Actions 自动化仓库：每天从 daeuniverse 官方 OpenWrt apk feed 同步最新 honk 组件，用 `makeself`（或内置自解压头）打成单个 `.run` 自解压安装包，发布到本仓库的 Release。
 
 **这个仓库不含任何 honk 源码，也不重新编译 honk** —— 它只是搬运并重新封装官方已经编译签名的 `.apk`，附带一个在路由器上执行的安装脚本。
 
