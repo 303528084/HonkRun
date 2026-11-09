@@ -42,7 +42,7 @@ HonkRun/
 发布策略：
 
 - 滚动 **`latest`** tag —— 下载链接固定，始终指向最新构建（`overwrite_files` 覆盖）。
-- 版本快照 tag —— 如 `honk-0.1.0_beta6-r1-20261109`，保留历史，不会被覆盖。
+- 版本快照 tag —— 如 `honk-0.1.0_beta6-r1-20261109`，不会被覆盖；工作流会**只保留最近 5 个**快照，更旧的快照 Release 连同 tag 自动删除（`latest` 永不清理）。要调整数量，改工作流里的 `KEEP_SNAPSHOTS`。这样避免 Release 资产无限累积。
 
 ## 产物
 
@@ -139,4 +139,4 @@ FEED_BASE=https://example.org/25.12/packages OUT_DIR=/tmp/out bash scripts/build
 
 本项目只做官方公开发布包的自动化抓取与封装，**不包含任何代理节点、订阅地址或网络访问配置**，也未修改 honk 二进制。honk 是 Linux 透明代理引擎，实际部署与使用请遵守所在地区的法律法规及网络管理规定，并自行评估在生产环境使用 alpha 阶段软件的风险。
 
-honk 遵循 `GPL-3.0-only`；本仓库的构建脚本可自由使用与修改。
+honk 遵循 `GPL-3.0-only`；本仓库的构建脚本可自由使用与修改。第三方组件的来源、许可证、未修改声明与商标归属详见 [NOTICE.md](NOTICE.md)。

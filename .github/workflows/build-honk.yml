@@ -119,6 +119,33 @@ jobs:
             dist/honk-run/manifest.txt
             dist/honk-run/fingerprint.txt
 
+      - name: 清理旧快照 Release（只保留最近 5 个）
+        if: steps.diff.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_SNAPSHOTS: 5
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(
+            gh api --paginate "repos/${{ github.repository }}/releases" \
+              --jq '.[] | select(.draft == false) | select(.tag_name | startswith("honk-")) | [.created_at, .tag_name] | @tsv' \
+              | sort -r | cut -f2
+          )
+          total=${#tags[@]}
+          echo "发现 $total 个快照 Release，保留最近 $KEEP_SNAPSHOTS 个"
+          if [ "$total" -le "$KEEP_SNAPSHOTS" ]; then
+            echo "无需清理（latest 滚动 tag 不在清理范围内）"
+            exit 0
+          fi
+          for tag in "${tags[@]:$KEEP_SNAPSHOTS}"; do
+            if gh release delete "$tag" --yes --cleanup-tag; then
+              echo "已删除过期快照: $tag"
+            else
+              echo "::warning::删除 $tag 失败，下次构建会重试"
+            fi
+          done
+
       - name: 写入运行摘要
         if: always()
         env:
