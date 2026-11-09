@@ -1,0 +1,136 @@
+name: Build honk .run packages
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重建并发布（即使上游没有变化）'
+        type: boolean
+        default: false
+      arches:
+        description: '要构建的架构，空格分隔；all 表示全部 5 个'
+        type: string
+        default: 'all'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-honk.yml'
+      - 'scripts/**'
+      - 'README.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: honk-run-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends makeself curl coreutils tar gzip
+
+      - name: 读取上一次构建指纹
+        id: prev
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPO}/releases/download/latest/fingerprint.txt"
+          prev=""
+          if curl -fsSL --max-time 30 "$url" -o /tmp/prev-fingerprint.txt; then
+            prev="$(tr -d '[:space:]' < /tmp/prev-fingerprint.txt)"
+          else
+            echo "::notice::没有历史 Release，视为首次构建"
+          fi
+          echo "value=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: 抓取 feed 并打包 .run
+        env:
+          ARCHES: ${{ inputs.arches }}
+        run: |
+          set -euo pipefail
+          arches="${ARCHES:-all}"
+          if [ "$arches" = "all" ]; then
+            bash scripts/build-run.sh --all
+          else
+            args=()
+            for a in $arches; do args+=(--arch "$a"); done
+            bash scripts/build-run.sh "${args[@]}"
+          fi
+
+      - name: 冒烟测试（解压并校验每个 .run）
+        run: bash scripts/verify-run.sh
+
+      - name: 判断上游是否有变化
+        id: diff
+        env:
+          FORCE: ${{ inputs.force }}
+          PREV: ${{ steps.prev.outputs.value }}
+        run: |
+          set -euo pipefail
+          cur="$(tr -d '[:space:]' < dist/honk-run/fingerprint.txt)"
+          echo "current=$cur" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat dist/honk-run/version.txt)" >> "$GITHUB_OUTPUT"
+          echo "archive_tag=$(cat dist/honk-run/archive-tag.txt)" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ] || [ "$cur" != "$PREV" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::上游 apk 未变化，跳过发布"
+          fi
+
+      - name: 发布滚动 Release（latest）
+        if: steps.diff.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "honk .run — ${{ steps.diff.outputs.version }}"
+          body_path: dist/honk-run/RELEASE.md
+          overwrite_files: true
+          make_latest: true
+          files: |
+            dist/honk-run/run/*.run
+            dist/honk-run/SHA256SUMS
+            dist/honk-run/manifest.txt
+            dist/honk-run/fingerprint.txt
+
+      - name: 发布版本快照
+        if: steps.diff.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.diff.outputs.archive_tag }}
+          name: "honk ${{ steps.diff.outputs.version }} — ${{ steps.diff.outputs.archive_tag }}"
+          body_path: dist/honk-run/RELEASE.md
+          make_latest: false
+          files: |
+            dist/honk-run/run/*.run
+            dist/honk-run/SHA256SUMS
+            dist/honk-run/manifest.txt
+            dist/honk-run/fingerprint.txt
+
+      - name: 写入运行摘要
+        if: always()
+        env:
+          VERSION: ${{ steps.diff.outputs.version }}
+          CHANGED: ${{ steps.diff.outputs.changed }}
+          CUR: ${{ steps.diff.outputs.current }}
+        run: |
+          {
+            echo "## honk .run 构建结果"
+            echo ""
+            echo "- honk 版本: \`${VERSION:-unknown}\`"
+            echo "- 上游指纹: \`${CUR:-none}\`"
+            echo "- 是否发布: \`${CHANGED:-false}\`"
+            echo "- 产物数量: $(find dist/honk-run/run -name '*.run' 2>/dev/null | wc -l)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+dist/
+*.tar.gz
+*.run
+.DS_Store
+Thumbs.db
+tmp/
