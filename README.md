@@ -42,7 +42,7 @@ HonkRun/
 发布策略：
 
 - 滚动 **`latest`** tag —— 下载链接固定，始终指向最新构建（`overwrite_files` 覆盖）。
-- 版本快照 tag —— 如 `honk-0.1.0_beta6-r1-20261109`，不会被覆盖；工作流会**只保留最近 5 个**快照，更旧的快照 Release 连同 tag 自动删除（`latest` 永不清理）。要调整数量，改工作流里的 `KEEP_SNAPSHOTS`。这样避免 Release 资产无限累积。
+- 版本快照 tag —— 如 `honk-0.1.0_beta6-r1-20261109-032300`（版本 + UTC 时间戳，避免同一天强制重建撞 tag），不会被覆盖；工作流会**只保留最近 5 个**快照，更旧的快照 Release 连同 tag 自动删除（`latest` 永不清理）。要调整数量，改工作流里的 `KEEP_SNAPSHOTS`。这样避免 Release 资产无限累积。
 
 ## 产物
 
@@ -80,8 +80,9 @@ sh honk.run
 | --- | --- |
 | 无参数 | 在线模式：导入签名公钥、写入 daeuniverse feed、`apk update`、`apk add honk@daeuniverse ...`（推荐） |
 | `--offline` | 离线模式：只装包内 apk，不联网 |
-| `--no-luci` | 不装 LuCI 界面与语言包 |
+| `--no-luci` | 不装 LuCI 界面与语言包（在线/离线都生效） |
 | `--enable` | 装完立即 enable + start（**默认不启动**） |
+| `--force` | 架构不匹配时仍然继续（默认直接中止，避免装错架构留下半装状态） |
 | `--help` | 查看帮助 |
 | `--target DIR --noexec` | 只解压到 DIR，不执行安装 |
 
@@ -99,14 +100,16 @@ sh honk.run --target /tmp/honk --noexec
 - **默认不自动启动服务**：honk 首次部署会改动网络 hook、命名空间和 sysctl，官方明确要求保留带外管理通道。装完只提示检查 `/etc/honk/config.dae`（默认 LAN 接口 `br-lan`），用户确认后再手动启用。
 - **检测到 dae 正在运行就直接中止**：dae 与 honk 不能同时接管 eBPF 数据面。
 - **官方 OpenWrt 无内建 BTF**：脚本检查 `/sys/kernel/btf/vmlinux`，缺失时自动追加 kmods 仓库行并尝试装 `vmlinux-btf`。
-- **指纹去重**：`fingerprint.txt` 是所有架构 apk 的「相对路径 + 字节数」排序后的 sha256，工作流与上次 `latest` Release 比对，相同则跳过发布。
+- **指纹去重**：`fingerprint.txt` 是所有架构 apk 内容的 sha256 排序后再取 sha256，工作流与上次 `latest` Release 比对，相同则跳过发布；因此上游同尺寸重编译也能被识别。
+- **公钥指纹校验（告警式）**：在线安装下载 feed 公钥后会比对 sha256（`FEED_KEY_SHA256`），不一致只告警并继续，避免上游正常轮换密钥导致旧 `.run` 无法安装；确认轮换后用 `HONK_FEED_KEY_SHA256=<新指纹>` 消除告警。
+- **离线安装可复现**：离线模式的 apk 会先复制到 `/etc/honk/apks` 再安装，避免 `.run` 临时解压目录被删除后 world 指向失效路径。
 - **双重打包兜底**：优先用 `makeself`；未安装、或 makeself 执行失败时，`build-run.sh` 自动回退到内置自解压头，生成同样兼容 `--target` / `--noexec` 的 `.run`。两种产物用法完全一致，CI 不存在单点故障。
 
 ## 前置条件与限制
 
 - 只支持 **OpenWrt / ImmortalWrt 25.12**，内核 6.12+，且具备 BTF；24.10 / 23.05 / opkg 系统不支持。
 - 只提供 64 位 ARM 与 x86_64，不支持 32 位 ARM / MIPS。
-- 架构必须和 `DISTRIB_ARCH` 严格一致，装错会失败。
+- 架构必须和 `DISTRIB_ARCH` 严格一致；不一致时安装脚本默认中止，确认要强制安装需加 `--force`。
 - 离线模式可能缺少 `v2ray-geoip` / `v2ray-geosite` / `vmlinux-btf` 等依赖，建议只在应急时用。
 - honk 自身处于 **Early alpha**（官方明确写着不建议用于生产），本仓库不会改变这一点。
 - 官方 feed 是首选安装方式（能自动升级）；`.run` 更适合单文件分发、离线应急或批量部署。

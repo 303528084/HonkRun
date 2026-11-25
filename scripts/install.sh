@@ -13,9 +13,15 @@ HONK_BUILD_ARCH="${HONK_BUILD_ARCH:-unknown}"
 HONK_BUILD_FEED="${HONK_BUILD_FEED:-https://openwrt.daeuniverse.org/25.12/packages}"
 HONK_BUILD_DATE="${HONK_BUILD_DATE:-unknown}"
 
+# Expected sha256 of the daeuniverse feed public key. A mismatch only warns: upstream may
+# have rotated the key. Set HONK_FEED_KEY_SHA256 to silence/update the expectation.
+FEED_KEY_URL="${HONK_FEED_KEY_URL:-https://openwrt.daeuniverse.org/public-key.pem}"
+FEED_KEY_SHA256="${HONK_FEED_KEY_SHA256:-5aae30568b7e08f86ea3e72a19fa281d835ba4eff8ab38849abcd2b0884c6cd5}"
+
 MODE="online"
 ENABLE=0
 WITH_LUCI=1
+ALLOW_ARCH_MISMATCH=0
 
 log()  { printf '[honk] %s\n' "$*"; }
 warn() { printf '[honk][WARN] %s\n' "$*" >&2; }
@@ -30,6 +36,7 @@ usage() {
   --online      显式指定在线安装
   --no-luci     不安装 LuCI 界面与语言包
   --enable      安装完成后立即 enable + start 服务（默认不启动）
+  --force       架构不匹配时仍然继续安装（危险，默认中止）
   --help        显示本帮助
 
   只解压不安装： sh xxx.run --target DIR --noexec
@@ -44,6 +51,7 @@ while [ "$#" -gt 0 ]; do
     --online)    MODE="online"; shift ;;
     --no-luci)   WITH_LUCI=0; shift ;;
     --enable)    ENABLE=1; shift ;;
+    --force)     ALLOW_ARCH_MISMATCH=1; shift ;;
     --help|-h)   usage; exit 0 ;;
     *)           die "未知参数: $1 （用 --help 查看用法）" ;;
   esac
@@ -51,6 +59,9 @@ done
 
 case "${HONK_OFFLINE:-}" in
   1|yes|true) MODE="offline" ;;
+esac
+case "${HONK_ALLOW_ARCH_MISMATCH:-}" in
+  1|yes|true) ALLOW_ARCH_MISMATCH=1 ;;
 esac
 
 log "honk ${HONK_BUILD_VERSION} / ${HONK_BUILD_ARCH} / built ${HONK_BUILD_DATE}"
@@ -69,8 +80,11 @@ case "${DISTRIB_RELEASE:-}" in
 esac
 
 if [ -n "${DISTRIB_ARCH:-}" ] && [ "${DISTRIB_ARCH}" != "${HONK_BUILD_ARCH}" ] && [ "${HONK_BUILD_ARCH}" != "unknown" ]; then
-  warn "架构不匹配：本包为 ${HONK_BUILD_ARCH}，设备为 ${DISTRIB_ARCH}。装错架构会失败。"
-  warn "请从 Release 下载与设备架构一致的 .run 文件。"
+  if [ "${ALLOW_ARCH_MISMATCH}" -eq 1 ]; then
+    warn "架构不匹配：本包为 ${HONK_BUILD_ARCH}，设备为 ${DISTRIB_ARCH}；已按 --force 继续，安装很可能失败。"
+  else
+    die "架构不匹配：本包为 ${HONK_BUILD_ARCH}，设备为 ${DISTRIB_ARCH}。请下载与 DISTRIB_ARCH 一致的 .run；确认强制安装请加 --force。"
+  fi
 fi
 
 if [ -x /etc/init.d/dae ] && /etc/init.d/dae running >/dev/null 2>&1; then
@@ -83,9 +97,17 @@ setup_feed() {
   mkdir -p /etc/apk/keys /etc/apk/repositories.d
   FEED_ROOT="$(printf '%s' "${HONK_BUILD_FEED}" | sed 's|/packages/*$||')"
   log "导入 feed 签名公钥 ..."
-  if ! wget -qO /etc/apk/keys/daeuniverse.pem https://openwrt.daeuniverse.org/public-key.pem; then
+  tmp_key="$(mktemp "${TMPDIR:-/tmp}/daeuniverse-key.XXXXXX")" || die "无法创建临时文件。"
+  if ! wget -qO "$tmp_key" "$FEED_KEY_URL"; then
+    rm -f "$tmp_key"
     die "下载签名公钥失败，请检查网络连通性。"
   fi
+  actual_key="$(sha256sum "$tmp_key" | cut -d' ' -f1)"
+  if [ "$actual_key" != "$FEED_KEY_SHA256" ]; then
+    warn "feed 公钥指纹与固定值不一致（期望 ${FEED_KEY_SHA256}，实际 ${actual_key}）。"
+    warn "可能上游已轮换密钥，也可能是中间人替换；将继续使用该公钥。如确认已轮换，可设 HONK_FEED_KEY_SHA256=<新指纹> 消除告警。"
+  fi
+  mv "$tmp_key" /etc/apk/keys/daeuniverse.pem || { rm -f "$tmp_key"; die "无法写入 /etc/apk/keys/daeuniverse.pem。"; }
   {
     printf '@daeuniverse %s/packages/%s/packages.adb\n' "${FEED_ROOT}" "${DISTRIB_ARCH}"
     if [ ! -f /sys/kernel/btf/vmlinux ]; then
@@ -117,13 +139,24 @@ install_online() {
 }
 
 install_offline() {
-  cd "${SELF_DIR}" || die "无法进入解压目录 ${SELF_DIR}"
-  set -- ./*.apk
-  [ -f "$1" ] || die "包内没有找到 .apk 文件。"
-  log "执行: apk add --allow-untrusted ./*.apk"
-  # shellcheck disable=SC2086
+  persist="/etc/honk/apks"
+  mkdir -p "$persist" || die "无法创建 $persist"
+  set --
+  for f in "${SELF_DIR}"/*.apk; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+      luci-app-honk-*|luci-lib-daeuniverse-*|luci-i18n-*)
+        [ "${WITH_LUCI}" -eq 1 ] || continue
+        ;;
+    esac
+    cp -f "$f" "$persist/" || die "无法复制 $(basename "$f") 到 $persist"
+    set -- "$@" "$persist/$(basename "$f")"
+  done
+  [ "$#" -gt 0 ] || die "包内没有可安装的 .apk 文件。"
+  log "已将 $# 个 apk 复制到 $persist（持久保存，避免 world 指向已删除的临时目录）"
+  log "执行: apk add --allow-untrusted $persist/*.apk"
   apk add --allow-untrusted "$@" || die "离线安装失败：可能缺少依赖（如 v2ray-geoip / v2ray-geosite / vmlinux-btf）。请改用默认的在线模式。"
-  warn "离线安装会把 honk 固定到这些本地文件，之后 'apk add' 可能报 breaks: world。"
+  warn "离线安装会把 honk 固定到 $persist 下的本地文件，之后 'apk add' 可能报 breaks: world。"
   warn "联网后请执行一次: apk add honk@daeuniverse luci-app-honk@daeuniverse 以解除固定。"
 }
 

@@ -39,41 +39,53 @@ usage() {
 EOF
 }
 
+# Pick the newest package for a prefix. Plain lexicographic order is wrong
+# (beta9 > beta10, r9 > r10), so sort by version where supported.
 pick_one() {
-  local prefix="$1" f best=""
+  local prefix="$1" f
   shift
   for f in "$@"; do
     case "$f" in
-      "${prefix}"*.apk) best="$f" ;;
+      "${prefix}"*.apk) printf '%s\n' "$f" ;;
     esac
-  done
-  printf '%s' "$best"
+  done | { LC_ALL=C sort -V 2>/dev/null || LC_ALL=C sort; } | tail -n 1
 }
 
 build_selfextracting() {
   local stage="$1" out="$2" name="$3" arch="$4"
   local payload="$TMP_ROOT/payload-$arch.tar.gz" header="$TMP_ROOT/header-$arch.sh"
-  local base="${name%.run}" n=0 i new
+  local base="${name%.run}" base_esc lines
 
   # --force-local keeps GNU tar from reading a Windows drive letter as a remote host.
   tar --force-local -czf "$payload" -C "$stage" . || return 1
-  # The header stores its own byte length; iterate until the length is stable.
-  for i in 1 2 3 4 5; do
-    sed -e "s|@@BASENAME@@|${base}|g" -e "s|@@OFFSET@@|${n}|g" \
-      "$SCRIPT_DIR/run-header.sh" > "$header" || return 1
-    new="$(wc -c < "$header" | tr -d '[:space:]')"
-    if [ "$new" = "$n" ]; then break; fi
-    n="$new"
-  done
+  # Escape sed replacement metacharacters so a version containing &, | or \ cannot corrupt the header.
+  base_esc="$(printf '%s' "$base" | sed -e 's/[\\&|]/\\&/g')"
+  # The payload starts on the line after the header. Line count does not depend on the
+  # substituted values, so two passes are enough (no fixed-point iteration needed).
+  sed -e "s|@@BASENAME@@|${base_esc}|g" -e "s|@@LINE@@|0|g" \
+    "$SCRIPT_DIR/run-header.sh" > "$header" || return 1
+  lines="$(wc -l < "$header" | tr -d '[:space:]')"
+  sed -e "s|@@BASENAME@@|${base_esc}|g" -e "s|@@LINE@@|$((lines + 1))|g" \
+    "$SCRIPT_DIR/run-header.sh" > "$header" || return 1
   cat "$header" "$payload" > "$out" || return 1
   chmod 755 "$out"
+}
+
+# Reject truncated or non-apk-v3 files. Package signature verification happens on the
+# device via `apk add` against the pinned feed key.
+verify_apk() {
+  local path="$1" name="$2" size
+  [ -f "$path" ] || die "文件不存在: $name"
+  size="$(wc -c < "$path" | tr -d '[:space:]')"
+  [ "$size" -gt 1024 ] || die "文件异常小: $name ($size bytes)"
+  [ "$(head -c 4 "$path")" = "ADBd" ] || die "不是有效的 apk v3 (ADB) 容器: $name"
 }
 
 build_one() {
   local arch="$1"
   local index="$TMP_ROOT/index-$arch.html"
   local dl="$OUT_DIR/apk/$arch" stage="$TMP_ROOT/stage-$arch"
-  local apk_files=() pkg_list=() f prefix version run_name run_path size
+  local apk_files=() pkg_list=() f prefix version run_name run_path size declared hdr
 
   mkdir -p "$dl" "$stage" "$OUT_DIR/run"
 
@@ -100,15 +112,21 @@ build_one() {
   log "[$arch] honk 版本 ${version}，共 ${#pkg_list[@]} 个 apk"
 
   for f in "${pkg_list[@]}"; do
-    if [ -s "${dl}/${f}" ] && [ "$(wc -c < "${dl}/${f}" | tr -d '[:space:]')" -gt 1024 ]; then
+    if [ -s "${dl}/${f}" ]; then
       log "[$arch] 已缓存 $f"
+      verify_apk "${dl}/${f}" "$f"
       continue
     fi
     log "[$arch] 下载 $f"
+    hdr="$TMP_ROOT/hdr-$arch-$f.txt"
     curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 600 \
-      "${FEED_BASE}/${arch}/${f}" -o "${dl}/${f}" || die "[$arch] 下载失败: $f"
+      -D "$hdr" "${FEED_BASE}/${arch}/${f}" -o "${dl}/${f}" || die "[$arch] 下载失败: $f"
     size="$(wc -c < "${dl}/${f}" | tr -d '[:space:]')"
-    [ "$size" -gt 1024 ] || die "[$arch] 文件异常小: $f ($size bytes)"
+    declared="$(grep -i '^content-length:' "$hdr" 2>/dev/null | tail -n 1 | tr -d '\r' | awk '{print $2}')" || true
+    if [ -n "$declared" ] && [ "$declared" != "$size" ]; then
+      die "[$arch] 大小与服务器声明不一致: $f (期望 $declared, 实际 $size)"
+    fi
+    verify_apk "${dl}/${f}" "$f"
   done
 
   cp "${dl}"/*.apk "$stage/"
@@ -157,7 +175,7 @@ write_meta() {
   [ -n "$first_version" ] || die "未能从下载结果确定 honk 版本"
 
   printf '%s\n' "$first_version" > "$OUT_DIR/version.txt"
-  date_tag="$(date -u +%Y%m%d)"
+  date_tag="$(date -u +%Y%m%d-%H%M%S)"
   printf 'honk-%s-%s\n' "$first_version" "$date_tag" > "$OUT_DIR/archive-tag.txt"
 
   {
@@ -170,8 +188,8 @@ write_meta() {
     printf '\n[packages]\n'
     for f in "$OUT_DIR"/apk/*/*.apk; do
       [ -f "$f" ] || continue
-      printf '%s/%s %s bytes\n' "$(basename "$(dirname "$f")")" "$(basename "$f")" \
-        "$(wc -c < "$f" | tr -d '[:space:]')"
+      printf '%s/%s %s bytes sha256=%s\n' "$(basename "$(dirname "$f")")" "$(basename "$f")" \
+        "$(wc -c < "$f" | tr -d '[:space:]')" "$(sha256sum "$f" | cut -d' ' -f1)"
     done
     printf '\n[run files]\n'
     for f in "$OUT_DIR"/run/*.run; do
@@ -186,7 +204,7 @@ write_meta() {
     for f in "$OUT_DIR"/apk/*/*.apk; do
       [ -f "$f" ] || continue
       rel="${f#${OUT_DIR}/apk/}"
-      printf '%s %s\n' "$rel" "$(wc -c < "$f" | tr -d '[:space:]')"
+      printf '%s %s\n' "$rel" "$(sha256sum "$f" | cut -d' ' -f1)"
     done
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1 > "$OUT_DIR/fingerprint.txt"
 

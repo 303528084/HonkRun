@@ -25,7 +25,7 @@ permissions:
 
 concurrency:
   group: honk-run-build
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -105,6 +105,37 @@ jobs:
             dist/honk-run/manifest.txt
             dist/honk-run/fingerprint.txt
 
+      - name: 清理 latest 中不属于本次构建的旧资产
+        if: steps.diff.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view latest --json assets --jq '.assets[].name' > /tmp/latest-assets.txt 2>/tmp/latest-assets.err; then
+            echo "::notice::latest 不存在或读取失败，跳过旧资产清理"
+            cat /tmp/latest-assets.err >&2 || true
+            exit 0
+          fi
+          ( cd dist/honk-run/run && ls -1 *.run 2>/dev/null || true ) | LC_ALL=C sort > /tmp/current-runs.txt
+          if [ ! -s /tmp/current-runs.txt ]; then
+            echo "::notice::本次没有 .run 产物，跳过旧资产清理"
+            exit 0
+          fi
+          while IFS= read -r asset; do
+            case "$asset" in
+              *.run)
+                if ! grep -qxF "$asset" /tmp/current-runs.txt; then
+                  if gh release delete-asset latest "$asset" --yes; then
+                    echo "已删除 latest 中的过期资产: $asset"
+                  else
+                    echo "::warning::删除资产 $asset 失败"
+                  fi
+                fi
+                ;;
+            esac
+          done < /tmp/latest-assets.txt
+
       - name: 发布版本快照
         if: steps.diff.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
@@ -112,6 +143,7 @@ jobs:
           tag_name: ${{ steps.diff.outputs.archive_tag }}
           name: "honk ${{ steps.diff.outputs.version }} — ${{ steps.diff.outputs.archive_tag }}"
           body_path: dist/honk-run/RELEASE.md
+          overwrite_files: true
           make_latest: false
           files: |
             dist/honk-run/run/*.run
@@ -127,11 +159,14 @@ jobs:
           KEEP_SNAPSHOTS: 5
         run: |
           set -euo pipefail
-          mapfile -t tags < <(
-            gh api --paginate "repos/${{ github.repository }}/releases" \
+          if ! gh api --paginate "repos/${{ github.repository }}/releases" \
               --jq '.[] | select(.draft == false) | select(.tag_name | startswith("honk-")) | [.created_at, .tag_name] | @tsv' \
-              | sort -r | cut -f2
-          )
+              > /tmp/releases.tsv 2>/tmp/releases.err; then
+            echo "::warning::获取 Release 列表失败，跳过清理"
+            cat /tmp/releases.err >&2 || true
+            exit 0
+          fi
+          mapfile -t tags < <(sort -r /tmp/releases.tsv | cut -f2)
           total=${#tags[@]}
           echo "发现 $total 个快照 Release，保留最近 $KEEP_SNAPSHOTS 个"
           if [ "$total" -le "$KEEP_SNAPSHOTS" ]; then

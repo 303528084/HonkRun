@@ -1,10 +1,12 @@
 #!/bin/sh
 # Self-extracting header used when makeself is not available.
-# scripts/build-run.sh replaces @@OFFSET@@ / @@BASENAME@@ and appends a tar.gz payload.
+# scripts/build-run.sh substitutes the basename and payload-line markers below, then appends a tar.gz payload.
 # Compatible with the common makeself flags: --target DIR, --noexec, --.
 set -u
 
-PAYLOAD_OFFSET=@@OFFSET@@
+# The payload starts on this line (1-based). Line-based extraction works with busybox
+# tail on OpenWrt, unlike `tail -c +N`.
+PAYLOAD_LINE=@@LINE@@
 BASENAME="@@BASENAME@@"
 
 SELF="$0"
@@ -25,8 +27,10 @@ while [ "$#" -gt 0 ]; do
     --target=*) TARGET="${1#--target=}"; shift ;;
     --) shift; break ;;
     --help|-h) break ;;
-    --quiet|-q|--noprogress|--nox11|--nowarn|--nomd5|--nocrc) shift ;;
-    -*) shift ;;
+    --quiet|-q|--noprogress|--nox11|--nowarn|--nomd5|--nocrc|--check) shift ;;
+    -*) printf '[honk][ERROR] 未知参数: %s\n' "$1" >&2
+        printf '[honk][ERROR] 安装脚本参数请用 -- 分隔，例如: sh xxx.run -- --offline\n' >&2
+        exit 2 ;;
     *) break ;;
   esac
 done
@@ -42,7 +46,7 @@ fi
 mkdir -p "$TARGET" || exit 1
 TARGET_ABS="$(cd "$TARGET" && pwd)" || exit 1
 
-if ! tail -c +$((PAYLOAD_OFFSET + 1)) "$SELF" | tar -xzf - -C "$TARGET_ABS"; then
+if ! tail -n "+$PAYLOAD_LINE" "$SELF" | tar -xzf - -C "$TARGET_ABS"; then
   printf '[honk][ERROR] 自解压失败，归档可能已损坏\n' >&2
   exit 1
 fi
